@@ -14,25 +14,25 @@ async def check():
             result = await session.call_tool("arm", arguments={"command": "arm"})
             print(result)
 
+            # Call set_home tool
+            result = await session.call_tool("set_home", arguments={"command": "set home"})
+            print(result)
+
             # Call takeoff tool
-            # result = await session.call_tool("takeoff", arguments={"altitude": 10})
-            # print(result)
+            result = await session.call_tool("takeoff", arguments={"altitude": 3.0})
+            print(result)
+
+            # Call goto tool
+            result = await session.call_tool("goto", arguments={"latitude": 10.842207, "longitude": 106.775404, "altitude": 4.0})
+            print(result)
+
+            # Call landing tool
+            result = await session.call_tool("land", arguments={"command": "land"})
+            print(result)
 
             #Call status tool
             result = await session.call_tool("status")
             print(result)
-
-            # # Get tax code
-            # result = await session.read_resource("resource://ma_so_thue")
-            # print("Tax code = {}".format(result))
-
-            # # Say hi
-            # result = await session.read_resource("resource://say_hi/Thuy")
-            # print("Say hi = {}".format(result))
-
-            # prompt = await session.get_prompt("review_sentence", arguments={"sentence":"So chung minh nhan dan la 123456789"})
-            # print("Prompt = {}".format(prompt))
-
 
 if __name__ == "__main__":
     import asyncio
