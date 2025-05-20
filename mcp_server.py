@@ -1,17 +1,16 @@
 import _collections_abc
 import collections
-from typing import Any, Coroutine
+from typing import Any
 
 collections.MutableMapping = _collections_abc.MutableMapping
-import time, os, math, logging
+import time, os, math
 from dotenv import load_dotenv
-from dronekit import connect, VehicleMode, LocationGlobalRelative
+from dronekit import connect, VehicleMode, LocationGlobalRelative, APIException, LocationGlobal, Command
 from mcp.server.fastmcp import FastMCP
 from pymavlink import mavutil
 
 # 1. Load configuration from .env
 load_dotenv()
-logger = logging.getLogger("mcp-drone")
 DRONE_CONN = os.getenv("DRONE_CONN")
 if not DRONE_CONN:
     raise RuntimeError("Please set DRONE_CONN env var to your autopilot endpoint, e.g. tcp:13.213.147.174:5762")
@@ -62,7 +61,7 @@ async def set_home() -> dict[str, float]:
     return {"home_lat": home.lat, "home_lon": home.lon, "home_alt": home.alt}
 
 @mcp.tool()
-async def takeoff(altitude: float) -> dict[str, float | Any]:
+async def takeoff(altitude: float | int) -> dict[str, float | Any]:
     """Take off to the given altitude (meters)."""
     print("Basic pre-arm checks")
     # Don't try to arm until autopilot is ready
@@ -86,18 +85,19 @@ async def takeoff(altitude: float) -> dict[str, float | Any]:
     # Wait until the vehicle reaches a safe height before processing the goto
     #  (otherwise the command after Vehicle.simple_takeoff will execute immediately).
     while True:
-        print(" Altitude: ", vehicle.location.global_relative_frame.alt)
+        current_alt = vehicle.location.global_relative_frame.alt
+        print(f" Altitude: {current_alt}")
         # Break and return from the function just below the target altitude.
-        if vehicle.location.global_relative_frame.alt >= altitude * 0.95:
+        if current_alt >= altitude * 0.95:
             print("Reached target altitude")
             break
         time.sleep(1)
-    return {"Target: ": altitude, "Current: ": vehicle.location.global_relative_frame.alt}
+    return {"Target": altitude, "Current": current_alt}
 
 @mcp.tool()
 async def goto(latitude: float, longitude: float, altitude: float) -> dict[str, str] | dict[str, float | Any]:
     """Fly to specified GPS coordinates."""
-    vehicle.airspeed = 3
+    vehicle.airspeed = 5
     # Ensure GUIDED mode
     vehicle.mode = VehicleMode("GUIDED")
     deadline = time.time() + 10
@@ -109,28 +109,24 @@ async def goto(latitude: float, longitude: float, altitude: float) -> dict[str, 
     # Compute absolute altitude (MSL) for target
     home = vehicle.home_location
     if home and home.alt is not None:
-        abs_alt = home.alt + altitude
+        abs_alt = altitude
     else:
         # fallback to current MSL alt + relative alt
-        abs_alt = vehicle.location.global_frame.alt + altitude
+        abs_alt = altitude
 
     target = LocationGlobalRelative(latitude, longitude, abs_alt)
     vehicle.simple_goto(target)
 
-    # Wait until within 1m horizontally and 0.5m vertically
-    start = time.time()
+    # Wait until within 1 m horizontally and 0.5 m vertically
     while True:
         curr_lat = vehicle.location.global_frame.lat
         curr_lon = vehicle.location.global_frame.lon
         dist = haversine(curr_lat, curr_lon, latitude, longitude)
         curr_rel_alt = vehicle.location.global_relative_frame.alt
         vert_err = abs(curr_rel_alt - altitude)
-        logger.info(f"Distance: {dist:.1f} m, Vert error: {vert_err:.1f} m")
         if dist <= 1.0 and vert_err <= 0.5:
             break
-        # if time.time() - start > 60:
-        #     return {"error": "Timeout reaching target"}
-        time.sleep(1)
+        time.sleep(30)
 
     return {
         "lat": latitude,
@@ -161,7 +157,174 @@ async def status() -> dict:
         "system_status": vehicle.system_status,
     }
 
+@mcp.tool()
+async def api_exception_info() -> str:
+    """Return the APIException class name and docstring."""
+    return APIException.__doc__ or APIException.__name__
+
+@mcp.tool()
+async def get_attitude() -> dict[str, float]:
+    """Get current vehicle attitude: pitch, yaw, roll (radians)."""
+    att = vehicle.attitude
+    return {f"pitch": att.pitch, "yaw": att.yaw, "roll": att.roll}
+
+@mcp.tool()
+async def get_capabilities() -> dict[str, bool]:
+    """Get vehicle capabilities."""
+    caps = vehicle.capabilities
+    return {attr: getattr(caps, attr) for attr in vars(caps) if not attr.startswith('_')}
+
+@mcp.tool()
+async def get_channel_overrides() -> dict[str, int]:
+    """Get current RC channel overrides."""
+    return vehicle.channels.overrides.copy()
+
+@mcp.tool()
+async def get_battery() -> dict[str, float | None]:
+    """Get current battery status as a resource."""
+    b = vehicle.battery
+    return {"voltage": b.voltage, "current": b.current, "level": b.level}
+
+@mcp.tool()
+async def location_global() -> dict[str, float]:
+    """Get location in a global frame relative to MSL."""
+    loc = vehicle.location.global_frame
+    return {"lat": loc.lat, "lon": loc.lon, "alt": loc.alt}
+
+@mcp.tool()
+async def location_global_relative() -> dict[str, float]:
+    """Get location in a global frame relative to home position."""
+    loc = vehicle.location.global_relative_frame
+    return {"lat": loc.lat, "lon": loc.lon, "alt": loc.alt}
+
+@mcp.tool()
+async def home_location() -> dict[str, float]:
+    """Get current home position."""
+    home = vehicle.home_location
+    return {"lat": home.lat, "lon": home.lon, "alt": home.alt}
+
+@mcp.tool()
+async def mode_info() -> str:
+    """Get current vehicle mode."""
+    return vehicle.mode.name
+
+@mcp.tool()
+async def get_location_local() -> dict[str, float]:
+    """Create a LocationLocal object and return its north, east, down components."""
+    loc = vehicle.location.local_frame
+    return {"north": loc.north, "east": loc.east, "down": loc.down}
+
+@mcp.tool()
+async def distance_home() -> float:
+    """Get distance from vehicle to home in meters (3D if down available, otherwise 2D)."""
+    return vehicle.distance_home()
+
+@mcp.tool()
+async def list_parameters() -> dict[str, Any]:
+    """List all vehicle parameters with their names and values."""
+    params = {}
+    for name, value in vehicle.parameters.items():
+        params[name] = value
+    return params
+
+@mcp.tool()
+async def get_rangefinder() -> dict[str, float]:
+    """Get rangefinder distance and voltage."""
+    rf = vehicle.rangefinder
+    return {"distance": rf.distance, "voltage": rf.voltage}
+
+# Gimbal API tools
+@mcp.tool()
+async def get_gimbal_attitude() -> dict[str, float]:
+    """Get current gimbal attitude: pitch, roll, yaw (degrees or radians)."""
+    g = vehicle.gimbal
+    return {"pitch": g.pitch, "roll": g.roll, "yaw": g.yaw}
+
+@mcp.tool()
+async def set_gimbal_orientation(pitch: float, roll: float, yaw: float) -> str:
+    """Set gimbal orientation."""
+    vehicle.gimbal.rotate(pitch, roll, yaw)
+    return "GIMBAL_ORIENTED"
+
+@mcp.tool()
+async def target_location(lat: float, lon: float, alt: float) -> str:
+    """Point the gimbal to the specified region of interest."""
+    # Use LocationGlobal for ROI
+    loc = LocationGlobal(lat, lon, alt)
+    vehicle.gimbal.target_location(loc)
+    return "GIMBAL_TARGET_SET"
+
+@mcp.tool()
+async def release_gimbal() -> str:
+    """Release control of the gimbal to RC/manual control."""
+    vehicle.gimbal.release()
+    return "GIMBAL_RELEASED"
+
+# Mission Command tools
+@mcp.tool()
+async def get_command_sequence() -> list[dict]:
+    """Get the current mission command sequence."""
+    # Download and return all commands in the mission
+    vehicle.commands.download()
+    vehicle.commands.wait_ready()
+
+    commands = []
+    for cmd in vehicle.commands:
+        commands.append({
+            "target_system": cmd.target_system,
+            "target_component": cmd.target_component,
+            "seq": cmd.seq,
+            "frame": cmd.frame,
+            "command": cmd.command,
+            "current": cmd.current,
+            "auto_continue": cmd.autocontinue,
+            "param1": cmd.param1,
+            "param2": cmd.param2,
+            "param3": cmd.param3,
+            "param4": cmd.param4,
+            "x": cmd.x,
+            "y": cmd.y,
+            "z": cmd.z
+        })
+    return commands
+
+@mcp.tool()
+async def create_command(cmds: list[dict]) -> str:
+    """Add mission commands from a list of dicts with 'type', 'lat', 'lon', 'alt'."""
+    # Download existing commands
+    vehicle.commands.download()
+    vehicle.commands.wait_ready()
+
+    # Iterate and create commands
+    for idx, c in enumerate(cmds):
+        cmd_type = c.get('type')
+        try:
+            lat = float(c.get('lat', 0))
+            lon = float(c.get('lon', 0))
+            alt = float(c.get('alt', 0))
+        except (TypeError, ValueError):
+            return f"error: invalid coordinates in command {idx}"
+        if cmd_type == 'takeoff':
+            command = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+        elif cmd_type == 'waypoint':
+            command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+        else:
+            return f"error: unknown command type '{cmd_type}' at index {idx}"
+        frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
+        # Build command with default params
+        cmd = Command(
+            0, 0, idx,
+            frame, command,
+            0, 0,
+            0, 0, 0, 0,
+            lat, lon, alt
+        )
+        vehicle.commands.add(cmd)
+    # Upload a new mission
+    vehicle.commands.upload()
+    return "MISSION_COMMANDS_UPLOADED"
+
 # 5. Run server through SSE transport
 if __name__ == "__main__":
-    # mcp.run(transport='sse')
-    mcp.run()
+    mcp.run(transport='sse')
+    # mcp.run()
