@@ -30,7 +30,7 @@ def haversine(lat1, lon1, lat2, lon2):
          math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2)
     return 6371000 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-# 3. Register tools
+# 3. Register takeoff/goto/land tools
 @mcp.tool()
 async def arm() -> str:
     """Arms the drone in GUIDED mode."""
@@ -42,23 +42,6 @@ async def arm() -> str:
     while not vehicle.armed and time.time() < deadline:
         time.sleep(1)
     return "ARMED" if vehicle.armed else "Arm timeout"
-
-@mcp.tool()
-async def set_home() -> dict[str, float]:
-    """Set the current position as home origin for relative altitude."""
-    msg = vehicle.message_factory.command_long_encode(
-        0, 0,
-        mavutil.mavlink.MAV_CMD_DO_SET_HOME,
-        0,
-        0, 0, 0, 0,
-        vehicle.location.global_frame.lat,
-        vehicle.location.global_frame.lon,
-        vehicle.location.global_frame.alt
-    )
-    vehicle.send_mavlink(msg)
-    time.sleep(1)
-    home = vehicle.home_location
-    return {"home_lat": home.lat, "home_lon": home.lon, "home_alt": home.alt}
 
 @mcp.tool()
 async def takeoff(altitude: float | int) -> dict[str, float | Any]:
@@ -142,6 +125,59 @@ async def land() -> str:
     vehicle.mode = VehicleMode("LAND")
     return "LANDING"
 
+# Register home and location tools
+@mcp.tool()
+async def set_home() -> dict[str, float]:
+    """Set the current position as home origin for relative altitude."""
+    msg = vehicle.message_factory.command_long_encode(
+        0, 0,
+        mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+        0,
+        0, 0, 0, 0,
+        vehicle.location.global_frame.lat,
+        vehicle.location.global_frame.lon,
+        vehicle.location.global_frame.alt
+    )
+    vehicle.send_mavlink(msg)
+    time.sleep(1)
+    home = vehicle.home_location
+    return {"home_lat": home.lat, "home_lon": home.lon, "home_alt": home.alt}
+
+@mcp.tool()
+async def location_global() -> dict[str, float]:
+    """Get location in a global frame relative to MSL."""
+    loc = vehicle.location.global_frame
+    return {"lat": loc.lat, "lon": loc.lon, "alt": loc.alt}
+
+@mcp.tool()
+async def location_global_relative() -> dict[str, float]:
+    """Get location in a global frame relative to home position."""
+    loc = vehicle.location.global_relative_frame
+    return {"lat": loc.lat, "lon": loc.lon, "alt": loc.alt}
+
+@mcp.tool()
+async def home_location() -> dict[str, float]:
+    """Get current home position."""
+    home = vehicle.home_location
+    return {"lat": home.lat, "lon": home.lon, "alt": home.alt}
+
+@mcp.tool()
+async def get_location_local() -> dict[str, float]:
+    """Create a LocationLocal object and return its north, east, down components."""
+    loc = vehicle.location.local_frame
+    return {"north": loc.north, "east": loc.east, "down": loc.down}
+
+@mcp.tool()
+async def distance_home() -> float:
+    """Get distance from vehicle to home in meters (3D if down available, otherwise 2D)."""
+    return vehicle.distance_home()
+
+@mcp.tool()
+async def switch_mode(mode: str) -> str:
+    """Switch vehicle mode."""
+    vehicle.mode = VehicleMode(mode)
+    return f"MODE_CHANGED_TO_{mode}"
+
 @mcp.tool()
 async def status() -> dict:
     """Get current vehicle status."""
@@ -152,11 +188,13 @@ async def status() -> dict:
             "lon": vehicle.location.global_relative_frame.lon,
             "alt": vehicle.location.global_relative_frame.alt
         },
+        "version": vehicle.version,
         "mode": vehicle.mode.name,
         "armed": vehicle.armed,
         "system_status": vehicle.system_status,
     }
 
+#Register vehicle info tools
 @mcp.tool()
 async def api_exception_info() -> str:
     """Return the APIException class name and docstring."""
@@ -186,52 +224,39 @@ async def get_battery() -> dict[str, float | None]:
     return {"voltage": b.voltage, "current": b.current, "level": b.level}
 
 @mcp.tool()
-async def location_global() -> dict[str, float]:
-    """Get location in a global frame relative to MSL."""
-    loc = vehicle.location.global_frame
-    return {"lat": loc.lat, "lon": loc.lon, "alt": loc.alt}
-
-@mcp.tool()
-async def location_global_relative() -> dict[str, float]:
-    """Get location in a global frame relative to home position."""
-    loc = vehicle.location.global_relative_frame
-    return {"lat": loc.lat, "lon": loc.lon, "alt": loc.alt}
-
-@mcp.tool()
-async def home_location() -> dict[str, float]:
-    """Get current home position."""
-    home = vehicle.home_location
-    return {"lat": home.lat, "lon": home.lon, "alt": home.alt}
-
-@mcp.tool()
-async def mode_info() -> str:
-    """Get current vehicle mode."""
-    return vehicle.mode.name
-
-@mcp.tool()
-async def get_location_local() -> dict[str, float]:
-    """Create a LocationLocal object and return its north, east, down components."""
-    loc = vehicle.location.local_frame
-    return {"north": loc.north, "east": loc.east, "down": loc.down}
-
-@mcp.tool()
-async def distance_home() -> float:
-    """Get distance from vehicle to home in meters (3D if down available, otherwise 2D)."""
-    return vehicle.distance_home()
-
-@mcp.tool()
-async def list_parameters() -> dict[str, Any]:
-    """List all vehicle parameters with their names and values."""
-    params = {}
-    for name, value in vehicle.parameters.items():
-        params[name] = value
-    return params
-
-@mcp.tool()
 async def get_rangefinder() -> dict[str, float]:
     """Get rangefinder distance and voltage."""
     rf = vehicle.rangefinder
     return {"distance": rf.distance, "voltage": rf.voltage}
+
+# @mcp.tool()
+# async def list_parameters() -> dict[str, Any]:
+#     """List all vehicle parameters with their names and values."""
+#     params = {}
+#     for name, value in vehicle.parameters.items():
+#         params[name] = value
+#     return params
+
+#Register parameter tools
+@mcp.tool()
+async def get_parameter(name: str) -> Any:
+    """Get a specific vehicle parameter by name."""
+    params = vehicle.parameters
+    if name not in params:
+        return f"error: parameter '{name}' not found"
+    return params[name]
+
+@mcp.tool()
+async def set_parameter(name: str, value: Any) -> Any:
+    """Set a specific vehicle parameter by name."""
+    params = vehicle.parameters
+    if name not in params:
+        return f"error: parameter '{name}' not found"
+    try:
+        vehicle.parameters[name] = value
+        return vehicle.parameters[name]
+    except Exception as e:
+        return f"error: {e}"
 
 # Gimbal API tools
 @mcp.tool()
@@ -260,7 +285,20 @@ async def release_gimbal() -> str:
     vehicle.gimbal.release()
     return "GIMBAL_RELEASED"
 
-# Mission Command tools
+@mcp.tool()
+async def get_gps_info() -> dict[str, Any]:
+    """Get GPS info: eph, epv, fix_type, satellites_visible."""
+    gps_info = vehicle.gps_0
+    if gps_info is None:
+        return {"error": "GPS info not available"}
+    return {
+        "eph": gps_info.eph,
+        "epv": gps_info.epv,
+        "fix_type": gps_info.fix_type,
+        "satellites_visible": gps_info.satellites_visible
+    }
+
+# Register mission command tools
 @mcp.tool()
 async def get_command_sequence() -> list[dict]:
     """Get the current mission command sequence."""
@@ -304,27 +342,50 @@ async def create_command(cmds: list[dict]) -> str:
             alt = float(c.get('alt', 0))
         except (TypeError, ValueError):
             return f"error: invalid coordinates in command {idx}"
+        # Build command with default params
+        frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
         if cmd_type == 'takeoff':
             command = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+            command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+            cmd = Command(
+                0, 0, 0,
+                frame, command,
+                0, 0,
+                0, 0, 0, 0,
+                0, 0, alt
+            )
+            vehicle.commands.add(cmd)
         elif cmd_type == 'waypoint':
             command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+            cmd = Command(
+                0, 0, 0,
+                frame, command,
+                0, 0,
+                0, 0, 0, 0,
+                lat, lon, alt
+            )
+            vehicle.commands.add(cmd)
         else:
             return f"error: unknown command type '{cmd_type}' at index {idx}"
-        frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
-        # Build command with default params
-        cmd = Command(
-            0, 0, idx,
-            frame, command,
-            0, 0,
-            0, 0, 0, 0,
-            lat, lon, alt
-        )
-        vehicle.commands.add(cmd)
     # Upload a new mission
     vehicle.commands.upload()
     return "MISSION_COMMANDS_UPLOADED"
 
+@mcp.tool()
+async def clear_all_mission() -> str:
+    """Clear all mission commands."""
+    vehicle.commands.clear()
+    vehicle.commands.upload()
+    return "MISSION_COMMANDS_CLEARED"
+
+@mcp.tool()
+async def waypoints_info() -> str:
+    """Return the number of waypoints."""
+    count = vehicle.commands.count
+    active = vehicle.commands.next
+    return "Number of waypoints: %d \nActive waypoint: %d" % (count, active)
+
 # 5. Run server through SSE transport
 if __name__ == "__main__":
-    mcp.run(transport='sse')
-    # mcp.run()
+    # mcp.run(transport='sse')
+    mcp.run()
