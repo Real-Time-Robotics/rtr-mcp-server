@@ -5,7 +5,7 @@ from typing import Any
 collections.MutableMapping = _collections_abc.MutableMapping
 import time, os, math
 from dotenv import load_dotenv
-from dronekit import connect, VehicleMode, LocationGlobalRelative, APIException, LocationGlobal, Command
+from dronekit import connect, VehicleMode, LocationGlobalRelative, APIException, LocationGlobal, Command, Vehicle
 from mcp.server.fastmcp import FastMCP
 from pymavlink import mavutil
 
@@ -13,7 +13,7 @@ from pymavlink import mavutil
 load_dotenv()
 DRONE_CONN = os.getenv("DRONE_CONN")
 if not DRONE_CONN:
-    raise RuntimeError("Please set DRONE_CONN env var to your autopilot endpoint, e.g. tcp:13.213.147.174:5762")
+    raise RuntimeError("Please set DRONE_CONN env var to your autopilot endpoint, e.g. udp:13.213.147.174:5762")
 
 vehicle = connect(DRONE_CONN, wait_ready=True)
 print(f"Connected. Mode: {vehicle.mode.name}")
@@ -30,37 +30,36 @@ def haversine(lat1, lon1, lat2, lon2):
          math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2)
     return 6371000 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-# 3. Register takeoff/goto/land tools
+# 3. Register arm/takeoff/goto/land tools
 @mcp.tool()
 async def arm() -> str:
-    """Arms the drone in GUIDED mode."""
+    """Arm the drone."""
     if not vehicle.is_armable:
         return "Vehicle not armable"
     vehicle.mode = VehicleMode("GUIDED")
     vehicle.armed = True
-    deadline = time.time() + 10
-    while not vehicle.armed and time.time() < deadline:
-        time.sleep(1)
+    time.sleep(1)
     return "ARMED" if vehicle.armed else "Arm timeout"
 
 @mcp.tool()
-async def takeoff(altitude: float | int) -> dict[str, float | Any]:
-    """Take off to the given altitude (meters)."""
+async def takeoff(altitude: float) -> dict[str, float | Any]:
+    """Execute a take-off operation to the given altitude (meters)."""
     print("Basic pre-arm checks")
-    # Don't try to arm until autopilot is ready
-    while not vehicle.is_armable:
-        print(" Waiting for vehicle to initialise...")
+    # # Don't try to arm until autopilot is ready
+    # while not vehicle.is_armable:
+    #     print(" Waiting for vehicle to initialise...")
+    #     time.sleep(1)
+
+    # Confirm vehicle armed before attempting to take off
+    while not vehicle.armed:
+        print(" Waiting for arming...")
         time.sleep(1)
 
     print("Arming motors")
     # Copter should arm in GUIDED mode
     vehicle.mode = VehicleMode("GUIDED")
     vehicle.armed = True
-
-    # Confirm vehicle armed before attempting to take off
-    while not vehicle.armed:
-        print(" Waiting for arming...")
-        time.sleep(1)
+    time.sleep(1)
 
     print("Taking off!")
     vehicle.simple_takeoff(altitude)  # Take off to target altitude
@@ -79,7 +78,7 @@ async def takeoff(altitude: float | int) -> dict[str, float | Any]:
 
 @mcp.tool()
 async def goto(latitude: float, longitude: float, altitude: float) -> dict[str, str] | dict[str, float | Any]:
-    """Fly to specified GPS coordinates."""
+    """Fly to specified GPS coordinates or change the current altitude."""
     vehicle.airspeed = 5
     # Ensure GUIDED mode
     vehicle.mode = VehicleMode("GUIDED")
@@ -305,6 +304,7 @@ async def get_command_sequence() -> list[dict]:
     # Download and return all commands in the mission
     vehicle.commands.download()
     vehicle.commands.wait_ready()
+    vehicle.commands._use_mission_int = True
 
     commands = []
     for cmd in vehicle.commands:
@@ -328,54 +328,67 @@ async def get_command_sequence() -> list[dict]:
 
 @mcp.tool()
 async def create_command(cmds: list[dict]) -> str:
-    """Add mission commands from a list of dicts with 'type', 'lat', 'lon', 'alt'."""
-    # Download existing commands
+    """Create one or multiple mission commands."""
+    # Download the current mission
     vehicle.commands.download()
     vehicle.commands.wait_ready()
+    vehicle.commands._use_mission_int = True
 
-    # Iterate and create commands
     for idx, c in enumerate(cmds):
-        cmd_type = c.get('type')
+        # Support both 'type' and 'command'
+        raw_cmd = c.get('type') or c.get('command')
+        cmd_key = str(raw_cmd).lower() if raw_cmd is not None else ''
+
+        # Parse coordinate: lat/long/alt or param5/6/7
         try:
-            lat = float(c.get('lat', 0))
-            lon = float(c.get('lon', 0))
-            alt = float(c.get('alt', 0))
+            lat = float(c.get('lat',
+                      c.get('latitude',
+                        c.get('param5', 0))))
+            lon = float(c.get('lon',
+                      c.get('longitude',
+                        c.get('param6', 0))))
+            alt = float(c.get('alt',
+                      c.get('altitude',
+                        c.get('param7', 0))))
         except (TypeError, ValueError):
             return f"error: invalid coordinates in command {idx}"
-        # Build command with default params
+
         frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
-        if cmd_type == 'takeoff':
-            command = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
-            command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+        # Build MAV command
+        if 'takeoff' in cmd_key or cmd_key == str(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF):
+            mav_cmd = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+            # x,y = 0 for takeoff
             cmd = Command(
-                0, 0, 0,
-                frame, command,
-                0, 0,
+                0, 0, idx,
+                frame, mav_cmd,
+                0, 1,
                 0, 0, 0, 0,
                 0, 0, alt
             )
-            vehicle.commands.add(cmd)
-        elif cmd_type == 'waypoint':
-            command = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+        elif 'waypoint' in cmd_key or cmd_key == str(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT):
+            mav_cmd = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
             cmd = Command(
-                0, 0, 0,
-                frame, command,
-                0, 0,
+                0, 0, idx,
+                frame, mav_cmd,
+                0, 1,
                 0, 0, 0, 0,
                 lat, lon, alt
             )
-            vehicle.commands.add(cmd)
         else:
-            return f"error: unknown command type '{cmd_type}' at index {idx}"
-    # Upload a new mission
+            return f"error: unknown command type '{raw_cmd}' at index {idx}"
+
+        vehicle.commands.add(cmd)
+
+    # Upload the mission to autopilot
     vehicle.commands.upload()
     return "MISSION_COMMANDS_UPLOADED"
 
 @mcp.tool()
 async def clear_all_mission() -> str:
     """Clear all mission commands."""
-    vehicle.commands.clear()
-    vehicle.commands.upload()
+    cmd = vehicle.commands
+    cmd.clear()
+    cmd.upload()
     return "MISSION_COMMANDS_CLEARED"
 
 @mcp.tool()
