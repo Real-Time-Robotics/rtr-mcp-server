@@ -5,9 +5,10 @@ from typing import Any
 collections.MutableMapping = _collections_abc.MutableMapping
 import time, os, math
 from dotenv import load_dotenv
-from dronekit import connect, VehicleMode, LocationGlobalRelative, APIException, LocationGlobal, Command, Vehicle
+from dronekit import connect, VehicleMode, LocationGlobalRelative, APIException, LocationGlobal, Command
 from mcp.server.fastmcp import FastMCP
 from pymavlink import mavutil
+import json
 
 # 1. Load configuration from .env
 load_dotenv()
@@ -45,10 +46,6 @@ async def arm() -> str:
 async def takeoff(altitude: float) -> dict[str, float | Any]:
     """Execute a take-off operation to the given altitude (meters)."""
     print("Basic pre-arm checks")
-    # # Don't try to arm until autopilot is ready
-    # while not vehicle.is_armable:
-    #     print(" Waiting for vehicle to initialise...")
-    #     time.sleep(1)
 
     # Confirm vehicle armed before attempting to take off
     while not vehicle.armed:
@@ -108,7 +105,7 @@ async def goto(latitude: float, longitude: float, altitude: float) -> dict[str, 
         vert_err = abs(curr_rel_alt - altitude)
         if dist <= 1.0 and vert_err <= 0.5:
             break
-        time.sleep(30)
+        time.sleep(10)
 
     return {
         "lat": latitude,
@@ -227,14 +224,6 @@ async def get_rangefinder() -> dict[str, float]:
     """Get rangefinder distance and voltage."""
     rf = vehicle.rangefinder
     return {"distance": rf.distance, "voltage": rf.voltage}
-
-# @mcp.tool()
-# async def list_parameters() -> dict[str, Any]:
-#     """List all vehicle parameters with their names and values."""
-#     params = {}
-#     for name, value in vehicle.parameters.items():
-#         params[name] = value
-#     return params
 
 #Register parameter tools
 @mcp.tool()
@@ -374,6 +363,12 @@ async def create_command(cmds: list[dict]) -> str:
                 0, 0, 0, 0,
                 lat, lon, alt
             )
+        elif 'return to launch' or 'RTL' in cmd_key or cmd_key == str(mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH):
+            mav_cmd = mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
+            cmd = Command(
+                0, 0, idx,
+                frame, mav_cmd,
+            )
         else:
             return f"error: unknown command type '{raw_cmd}' at index {idx}"
 
@@ -385,11 +380,93 @@ async def create_command(cmds: list[dict]) -> str:
 
 @mcp.tool()
 async def clear_all_mission() -> str:
-    """Clear all mission commands."""
+    """Clear all missions commands."""
     cmd = vehicle.commands
     cmd.clear()
     cmd.upload()
     return "MISSION_COMMANDS_CLEARED"
+
+@mcp.tool()
+async def readmission(file_name) -> list[Command]:
+    mission_list = []
+     # Load JSON and get top-level items
+    with open(file_name, 'r') as f:
+        data = json.load(f)
+    if data.get('fileType') != 'Plan':
+        raise Exception(f"Unsupported fileType: {data.get('fileType')}")
+
+    items = data.get('mission', {}).get('items', [])
+    seq = 0
+
+    for item in items:
+    # Determine if this is SimpleItem or ComplexItem
+        if item.get('type') == 'SimpleItem':
+            entry_list = [item]
+        elif item.get('type') == 'ComplexItem':
+        # find a nested dict that contains the real 'Items' list
+            nested = None
+            for v in item.values():
+                if isinstance(v, dict) and 'Items' in v:
+                    nested = v
+                    break
+            if nested is None:
+                continue
+            entry_list = nested['Items']
+        else:
+        # skip unsupported item types
+            continue
+
+        # Flatten each subentry into a Command
+
+        for sub in entry_list:
+            frame = sub.get('frame')
+            mav_command = sub.get('command')
+            params = sub.get('params', [])
+            # normalize params → list of 7 floats
+            if not isinstance(params, list) or len(params) != 7:
+                raise Exception(f"Invalid params length at seq {seq}: {len(params)}")
+
+            try:
+                p = [float(x) if x is not None else 0.0 for x in params]
+            except Exception as e:
+                raise Exception(f"Param conversion error at seq {seq}: {e}")
+
+            current = 0
+            autocontinue = 1 if sub.get('autoContinue', False) else 0
+            # build Command (target_system=0, target_component=0, seq=seq, frame, command, current, autocontinue, p1…p7)
+            cmd = Command(
+                0, 0, seq,
+                sub['frame'], sub['command'],
+                0, 1,
+                p[0], p[1], p[2], p[3],
+                p[4], p[5], p[6]
+            )
+            mission_list.append(cmd)
+            seq += 1
+
+    return mission_list
+
+@mcp.tool()
+async def upload_mission(file_name) -> str:
+        """
+        Upload a mission from a file.
+        """
+        #Read a mission from a file
+        mission_list = await readmission(file_name)
+        vehicle.commands.download()
+        vehicle.commands.wait_ready()
+
+        print ("\nUpload mission from a file: %s" % file_name)
+        #Clear all existing missions from a vehicle
+        print ('Clear mission')
+        cmds = vehicle.commands
+        cmds.clear()
+        #Add a new mission to the vehicle
+        for command in mission_list:
+            cmds.add(command)
+        print(' Upload mission')
+        vehicle.commands.upload()
+        return "MISSION_UPLOADED"
 
 @mcp.tool()
 async def waypoints_info() -> str:

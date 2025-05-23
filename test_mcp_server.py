@@ -13,17 +13,22 @@ async def check():
             # Call set_home tool
             # result = await session.call_tool("land")
             # print(result)
+
             # Call arm tool
-            result = await session.call_tool("arm", arguments={"command": "arm"})
-            print(result)
+            # result = await session.call_tool("arm", arguments={"command": "arm"})
+            # print(result)
 
             # Call set_home tool
-            # result = await session.call_tool("set_home", arguments={"command": "set home"})
+            result = await session.call_tool("waypoints_info", arguments={"command": "waypoint info"})
+            print(result)
+
+            # Call takeoff tool
+            # result = await session.call_tool("readmission", arguments={"file_name": "/Users/maichieuthuy/Desktop/z.plan"})
             # print(result)
 
             # Call takeoff tool
-            result = await session.call_tool("takeoff", arguments={"altitude": 5.0})
-            print(result)
+            # result = await session.call_tool("upload_mission", arguments={"file_name": "/Users/maichieuthuy/Desktop/z.plan"})
+            # print(result)
 
             # Call goto tool
             # result = await session.call_tool("goto", arguments={"latitude": 10.841626, "longitude": 106.773167, "altitude": 30.0})
