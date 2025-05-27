@@ -1,11 +1,13 @@
 import _collections_abc
 import collections
-from typing import Any
+from typing import Any, List, Dict
+import re
 
 collections.MutableMapping = _collections_abc.MutableMapping
 import time, os, math
 from dotenv import load_dotenv
 from dronekit import connect, VehicleMode, LocationGlobalRelative, APIException, LocationGlobal, Command
+from shapely.geometry import Polygon, LineString
 from mcp.server.fastmcp import FastMCP
 from pymavlink import mavutil
 import json
@@ -14,7 +16,7 @@ import json
 load_dotenv()
 DRONE_CONN = os.getenv("DRONE_CONN")
 if not DRONE_CONN:
-    raise RuntimeError("Please set DRONE_CONN env var to your autopilot endpoint, e.g. udp:13.213.147.174:5762")
+    raise RuntimeError("Please set DRONE_CONN env var to your autopilot endpoint, e.g. tcp:13.213.147.174:5762")
 
 vehicle = connect(DRONE_CONN, wait_ready=True)
 print(f"Connected. Mode: {vehicle.mode.name}")
@@ -378,6 +380,7 @@ async def create_command(cmds: list[dict]) -> str:
     vehicle.commands.upload()
     return "MISSION_COMMANDS_UPLOADED"
 
+
 @mcp.tool()
 async def clear_all_mission() -> str:
     """Clear all missions commands."""
@@ -474,6 +477,125 @@ async def waypoints_info() -> str:
     count = vehicle.commands.count
     active = vehicle.commands.next
     return "Number of waypoints: %d \nActive waypoint: %d" % (count, active)
+
+CAMERA_PARAMS = {
+     "sony_a7riv": {
+         "sensor_width_mm": 23.5,
+         "sensor_height_mm": 15.6,
+         "focal_length_mm": 16.0
+     }
+ }
+
+def normalize_name(name: str) -> str:
+    """Lowercase and remove non-alphanumeric for fuzzy matching."""
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+def parse_prompt(prompt: str) -> Dict[str, Any]:
+    """
+    Extracts GPS points, altitude, overlap, and camera from the user prompt.
+    """
+    points = re.findall(r"(-?\d+\.\d+)[, ]+(-?\d+\.\d+)", prompt)
+    if len(points) < 4:
+        raise ValueError("Please provide 4 GPS points as lat,long pairs in the prompt.")
+    coords = [(float(lat), float(lon)) for lat, lon in points[:4]]
+
+    alt_match = re.search(r"(\d+)(?:m| mét)", prompt)
+    altitude = float(alt_match.group(1)) if alt_match else 50.0
+
+    overlap_match = re.search(r"(\d+)%", prompt)
+    overlap = float(overlap_match.group(1)) / 100.0 if overlap_match else 0.8
+
+    camera_match = re.search(r"mapping using is ([\w\s0-9-]+)", prompt, re.IGNORECASE)
+    camera_raw = camera_match.group(1).strip() if camera_match else 'sony a7riv'
+    # Normalize and match against keys
+    norm_input = normalize_name(camera_raw)
+    matched_key = None
+    for key in CAMERA_PARAMS:
+        if normalize_name(key) == norm_input:
+            matched_key = key
+            break
+    if not matched_key:
+        raise ValueError(f"Camera specs for '{camera_raw}' not found.")
+    camera = matched_key
+
+    return {'points': coords, 'altitude': altitude, 'overlap': overlap, 'camera': camera}
+
+def calculate_spacing(camera: str, altitude: float, overlap: float) -> float:
+    """Calculates line spacing based on camera specs, altitude, and overlap."""
+    specs = CAMERA_PARAMS[camera]
+    swath = specs['sensor_width_mm'] / specs['focal_length_mm'] * altitude
+    spacing_m = swath * (1 - overlap)
+    # convert meters to degrees latitude (~111000 m per degree)
+    return spacing_m / 111000.0
+
+def generate_zigzag(points: List[tuple], spacing: float) -> List[tuple]:
+    """Generates zigzag waypoints within the polygon defined by points."""
+    poly = Polygon(points)
+    minx, miny, maxx, maxy = poly.bounds
+    lines: List[List[tuple]] = []
+    y = miny
+    idx = 0
+    while y <= maxy:
+        line = LineString([(minx, y), (maxx, y)])
+        inter = line.intersection(poly)
+        if not inter.is_empty:
+            coords = list(inter.coords)
+            if idx % 2:
+                coords.reverse()
+            lines.append(coords)
+            idx += 1
+        y += spacing
+    return [pt for segment in lines for pt in segment]
+
+@mcp.tool()
+async def mission_survey(prompt: str) -> str:
+    """
+    Generate and upload a survey mission:
+    - Prompt must include 4 GPS points, altitude (m), overlap (%), and camera model.
+    - Connects via MAVLink, clears an existing mission, uploads takeoff and zigzag waypoints.
+    """
+    # Parse user inputs
+    parsed = parse_prompt(prompt)
+    spacing = calculate_spacing(parsed['camera'], parsed['altitude'], parsed['overlap'])
+    waypoints = generate_zigzag(parsed['points'], spacing)
+
+    # Connect to vehicle
+    cmds = vehicle.commands
+    cmds.clear()
+
+    # Add a takeoff command
+    lat0, lon0 = parsed['points'][0]
+    cmds.add(Command(
+        0, 0, 0,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0, 0, 0, 0, 0, 0,
+        lat0, lon0, parsed['altitude']
+    ))
+
+    # Add survey waypoints
+    for lat, lon in waypoints:
+        cmds.add(Command(
+            0, 0, 0,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            0, 0, 0, 0, 0, 0,
+            lat, lon, parsed['altitude']
+        ))
+
+    # Add Return to Launch if requested
+    if re.search(r"return to launch|rtl", prompt, re.IGNORECASE):
+        cmds.add(Command(
+            0, 0, 0,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            Command.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+            0, 0, 0, 0, 0, 0,
+            0, 0, 0
+        ))
+
+    # Upload a mission
+    cmds.upload()
+    return f"MISSION_UPLOADED with {len(waypoints)} waypoints"
 
 # 5. Run server through SSE transport
 if __name__ == "__main__":
