@@ -1,22 +1,24 @@
 import _collections_abc
 import collections
-from typing import Any, List, Dict
-import re
+from typing import Any, List, Dict, Union, Tuple
 
 collections.MutableMapping = _collections_abc.MutableMapping
-import time, os, math
+import time, os, math, json, re, requests
 from dotenv import load_dotenv
 from dronekit import connect, VehicleMode, LocationGlobalRelative, APIException, LocationGlobal, Command
 from shapely.geometry import Polygon, LineString
 from mcp.server.fastmcp import FastMCP
 from pymavlink import mavutil
-import json
 
 # 1. Load configuration from .env
 load_dotenv()
 DRONE_CONN = os.getenv("DRONE_CONN")
 if not DRONE_CONN:
     raise RuntimeError("Please set DRONE_CONN env var to your autopilot endpoint, e.g. tcp:13.213.147.174:5762")
+
+_google_api_key = os.getenv('GOOGLEMAPS_API_KEY')
+if not _google_api_key:
+    raise RuntimeError("Google Maps API Key not found. Please set GOOGLEMAPS_API_KEY.")
 
 vehicle = connect(DRONE_CONN, wait_ready=True)
 print(f"Connected. Mode: {vehicle.mode.name}")
@@ -27,11 +29,27 @@ mcp = FastMCP(
 )
 
 def haversine(lat1, lon1, lat2, lon2):
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat/2)**2 +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2)
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (math.sin(d_lat/2)**2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon/2)**2)
     return 6371000 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+@mcp.tool()
+def geocode_address(address: str) -> Tuple[float, float]:
+    """Convert an address/place string into (lat, lon) using Google Maps Geocoding API."""
+    params = {
+        'address': address,
+        'key': _google_api_key
+    }
+    response = requests.get('https://maps.googleapis.com/maps/api/geocode/json', params=params, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    results = data.get('results')
+    if not results:
+        raise ValueError(f"No geocoding results for address: '{address}'")
+    location = results[0]['geometry']['location']
+    return float(location['lat']), float(location['lng'])
 
 # 3. Register arm/takeoff/goto/land tools
 @mcp.tool()
@@ -76,9 +94,25 @@ async def takeoff(altitude: float) -> dict[str, float | Any]:
     return {"Target": altitude, "Current": current_alt}
 
 @mcp.tool()
-async def goto(latitude: float, longitude: float, altitude: float) -> dict[str, str] | dict[str, float | Any]:
-    """Fly to specified GPS coordinates or change the current altitude."""
-    vehicle.airspeed = 5
+async def goto(latitude: Union[str, float], altitude: float,
+               longitude: Union[float, None] = None) -> dict[str, str] | dict[str, float | Any]:
+    """Fly to specified GPS coordinates or named place.
+    Parameters:
+    - latitude & longitude: if both are provided as floats, treated as direct coords.
+    - latitude: if it's a string and longitude is None, treated as address/place name to geocode.
+    - altitude: target relative altitude in meters.
+    Returns a dict with final coordinates and achieved status or error."""
+    vehicle.airspeed = 10
+
+    # Determine coords
+    if longitude is None:
+        # latitude param holds address string
+        address = str(latitude)
+        lat, lon = geocode_address(address)
+    else:
+        lat = latitude
+        lon = longitude
+
     # Ensure GUIDED mode
     vehicle.mode = VehicleMode("GUIDED")
     deadline = time.time() + 10
@@ -95,14 +129,14 @@ async def goto(latitude: float, longitude: float, altitude: float) -> dict[str, 
         # fallback to current MSL alt + relative alt
         abs_alt = altitude
 
-    target = LocationGlobalRelative(latitude, longitude, abs_alt)
+    target = LocationGlobalRelative(lat, lon, abs_alt)
     vehicle.simple_goto(target)
 
     # Wait until within 1 m horizontally and 0.5 m vertically
     while True:
         curr_lat = vehicle.location.global_frame.lat
         curr_lon = vehicle.location.global_frame.lon
-        dist = haversine(curr_lat, curr_lon, latitude, longitude)
+        dist = haversine(curr_lat, curr_lon, lat, lon)
         curr_rel_alt = vehicle.location.global_relative_frame.alt
         vert_err = abs(curr_rel_alt - altitude)
         if dist <= 1.0 and vert_err <= 0.5:
@@ -110,8 +144,8 @@ async def goto(latitude: float, longitude: float, altitude: float) -> dict[str, 
         time.sleep(10)
 
     return {
-        "lat": latitude,
-        "lon": longitude,
+        "lat": lat,
+        "lon": lon,
         "target_rel": altitude,
         "achieved_dist": dist,
         "achieved_rel": curr_rel_alt
@@ -161,7 +195,7 @@ async def home_location() -> dict[str, float]:
 
 @mcp.tool()
 async def get_location_local() -> dict[str, float]:
-    """Create a LocationLocal object and return its north, east, down components."""
+    """Get LocationLocal object and return its north, east, down components."""
     loc = vehicle.location.local_frame
     return {"north": loc.north, "east": loc.east, "down": loc.down}
 
@@ -288,10 +322,10 @@ async def get_gps_info() -> dict[str, Any]:
         "satellites_visible": gps_info.satellites_visible
     }
 
-# Register mission command tools
+# Register mission planner tools
 @mcp.tool()
 async def get_command_sequence() -> list[dict]:
-    """Get the current mission command sequence."""
+    """Get the current mission plan sequence."""
     # Download and return all commands in the mission
     vehicle.commands.download()
     vehicle.commands.wait_ready()
@@ -318,35 +352,32 @@ async def get_command_sequence() -> list[dict]:
     return commands
 
 @mcp.tool()
-async def create_command(cmds: list[dict]) -> str:
-    """Create one or multiple mission commands."""
+async def create_command(cmds: List[Dict[str, Any]]) -> str:
+    """Create a mission plan from user prompt or after read a mission file."""
     # Download the current mission
     vehicle.commands.download()
     vehicle.commands.wait_ready()
-    vehicle.commands._use_mission_int = True
 
     for idx, c in enumerate(cmds):
         # Support both 'type' and 'command'
-        raw_cmd = c.get('type') or c.get('command')
-        cmd_key = str(raw_cmd).lower() if raw_cmd is not None else ''
+        raw = c.get('type') or c.get('command')
+        key = str(raw).lower() if raw is not None else ''
 
-        # Parse coordinate: lat/long/alt or param5/6/7
-        try:
-            lat = float(c.get('lat',
-                      c.get('latitude',
-                        c.get('param5', 0))))
-            lon = float(c.get('lon',
-                      c.get('longitude',
-                        c.get('param6', 0))))
-            alt = float(c.get('alt',
-                      c.get('altitude',
-                        c.get('param7', 0))))
-        except (TypeError, ValueError):
-            return f"error: invalid coordinates in command {idx}"
+        # Determine coordinates or address
+        if 'address' in c and isinstance(c['address'], str):
+            lat, lon = geocode_address(c['address'])
+            alt = float(c.get('alt', c.get('altitude', 0)))
+        else:
+            try:
+                lat = float(c.get('lat', c.get('latitude', c.get('param5', 0))))
+                lon = float(c.get('lon', c.get('longitude', c.get('param6', 0))))
+                alt = float(c.get('alt', c.get('altitude', c.get('param7', 0))))
+            except (TypeError, ValueError):
+                return f"error: invalid coordinates in command {idx}"
 
         frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
         # Build MAV command
-        if 'takeoff' in cmd_key or cmd_key == str(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF):
+        if 'takeoff' in key or key == str(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF):
             mav_cmd = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
             # x,y = 0 for takeoff
             cmd = Command(
@@ -356,7 +387,7 @@ async def create_command(cmds: list[dict]) -> str:
                 0, 0, 0, 0,
                 0, 0, alt
             )
-        elif 'waypoint' in cmd_key or cmd_key == str(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT):
+        elif 'waypoint' in key or key == str(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT):
             mav_cmd = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
             cmd = Command(
                 0, 0, idx,
@@ -365,25 +396,25 @@ async def create_command(cmds: list[dict]) -> str:
                 0, 0, 0, 0,
                 lat, lon, alt
             )
-        elif 'return to launch' or 'RTL' in cmd_key or cmd_key == str(mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH):
+        elif 'return to launch' or 'RTL' in key or key == str(mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH):
             mav_cmd = mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
             cmd = Command(
                 0, 0, idx,
                 frame, mav_cmd,
             )
         else:
-            return f"error: unknown command type '{raw_cmd}' at index {idx}"
+            return f"error: unknown command type '{raw}' at index {idx}"
 
         vehicle.commands.add(cmd)
 
     # Upload the mission to autopilot
     vehicle.commands.upload()
+    # vehicle.mode = VehicleMode("AUTO")
     return "MISSION_COMMANDS_UPLOADED"
-
 
 @mcp.tool()
 async def clear_all_mission() -> str:
-    """Clear all missions commands."""
+    """Clear all missions plan."""
     cmd = vehicle.commands
     cmd.clear()
     cmd.upload()
@@ -391,6 +422,7 @@ async def clear_all_mission() -> str:
 
 @mcp.tool()
 async def readmission(file_name) -> list[Command]:
+    """Read mission plan file with input is file's pathname."""
     mission_list = []
      # Load JSON and get top-level items
     with open(file_name, 'r') as f:
@@ -420,7 +452,6 @@ async def readmission(file_name) -> list[Command]:
             continue
 
         # Flatten each subentry into a Command
-
         for sub in entry_list:
             frame = sub.get('frame')
             mav_command = sub.get('command')
@@ -428,7 +459,6 @@ async def readmission(file_name) -> list[Command]:
             # normalize params → list of 7 floats
             if not isinstance(params, list) or len(params) != 7:
                 raise Exception(f"Invalid params length at seq {seq}: {len(params)}")
-
             try:
                 p = [float(x) if x is not None else 0.0 for x in params]
             except Exception as e:
@@ -451,23 +481,21 @@ async def readmission(file_name) -> list[Command]:
 
 @mcp.tool()
 async def upload_mission(file_name) -> str:
-        """
-        Upload a mission from a file.
-        """
-        #Read a mission from a file
+        """Upload a mission from a file."""
+        # Read a mission from a file
         mission_list = await readmission(file_name)
         vehicle.commands.download()
         vehicle.commands.wait_ready()
 
         print ("\nUpload mission from a file: %s" % file_name)
-        #Clear all existing missions from a vehicle
+        # Clear all existing missions from a vehicle
         print ('Clear mission')
         cmds = vehicle.commands
         cmds.clear()
-        #Add a new mission to the vehicle
+        # Add a new mission to the vehicle
         for command in mission_list:
             cmds.add(command)
-        print(' Upload mission')
+        print('Upload mission')
         vehicle.commands.upload()
         return "MISSION_UPLOADED"
 
@@ -491,9 +519,7 @@ def normalize_name(name: str) -> str:
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
 def parse_prompt(prompt: str) -> Dict[str, Any]:
-    """
-    Extracts GPS points, altitude, overlap, and camera from the user prompt.
-    """
+    """Extracts GPS points, altitude, overlap, and camera from the user prompt."""
     points = re.findall(r"(-?\d+\.\d+)[, ]+(-?\d+\.\d+)", prompt)
     if len(points) < 4:
         raise ValueError("Please provide 4 GPS points as lat,long pairs in the prompt.")
@@ -510,6 +536,13 @@ def parse_prompt(prompt: str) -> Dict[str, Any]:
     # Normalize and match against keys
     norm_input = normalize_name(camera_raw)
     matched_key = None
+
+    # Address mode
+    addr_m = re.search(r"(?:địa chỉ|address)\s+(.+?)(?:,|$)", prompt, re.IGNORECASE)
+    if addr_m:
+        address = addr_m.group(1).strip()
+        lat, lon = geocode_address(address)
+        return {'mode': 'point', 'coords': (lat, lon), 'altitude': altitude}
     for key in CAMERA_PARAMS:
         if normalize_name(key) == norm_input:
             matched_key = key
@@ -551,7 +584,7 @@ def generate_zigzag(points: List[tuple], spacing: float) -> List[tuple]:
 async def mission_survey(prompt: str) -> str:
     """
     Generate and upload a survey mission:
-    - Prompt must include 4 GPS points, altitude (m), overlap (%), and camera model.
+    - Prompt must include GPS points, altitude (m), overlap (%), and camera model.
     - Connects via MAVLink, clears an existing mission, uploads takeoff and zigzag waypoints.
     """
     # Parse user inputs
@@ -588,7 +621,7 @@ async def mission_survey(prompt: str) -> str:
         cmds.add(Command(
             0, 0, 0,
             mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-            Command.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+            mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
             0, 0, 0, 0, 0, 0,
             0, 0, 0
         ))
@@ -597,7 +630,66 @@ async def mission_survey(prompt: str) -> str:
     cmds.upload()
     return f"MISSION_UPLOADED with {len(waypoints)} waypoints"
 
+@mcp.tool()
+async def save_plan(file_path: str) -> str:
+    """Save the current mission to a .plan file in QGroundControl WPL format."""
+    while not vehicle.is_armable:
+        time.sleep(1)
+    cmds = vehicle.commands
+    cmds.download()
+    cmds.wait_ready()
+    mission_list = list(cmds)
+
+    # Build WPL file
+    output = 'QGA WPL 110\n'
+    home = vehicle.home_location
+    output += f"0\t1\t0\t16\t0\t0\t0\t0\t{home.lat}\t{home.lon}\t{home.alt}\t1\n"
+    for cmd in mission_list:
+        output += (
+            f"{cmd.seq}\t{cmd.current}\t{cmd.frame}\t{cmd.command}\t"
+            f"{cmd.param1}\t{cmd.param2}\t{cmd.param3}\t{cmd.param4}\t"
+            f"{cmd.x}\t{cmd.y}\t{cmd.z}\t{cmd.autocontinue}\n"
+        )
+
+    with open(file_path, 'w') as f:
+        f.write(output)
+
+    return f"PLAN_SAVED to {file_path}"
+
+@mcp.tool()
+async def create_plan_from_prompt(prompt: str, file_path: str) -> str:
+    """
+    Parse a natural-language prompt to build a mission plan and save it to a .plan file.
+
+    Supported syntax:
+      - 'takeoff at <address> at altitude Xm'
+      - 'waypoint [n] at <address> at altitude Xm'
+      - 'return to launch'
+    Clauses separated by commas.
+    """
+    clauses = [cl.strip() for cl in re.split(r',', prompt) if cl.strip()]
+    cmds = []
+    for cl in clauses:
+        m_to = re.match(r'(?:takeoff)\s+at\s+(.+?)\s+at\s+altitude\s+(\d+\.?\d*)m', cl, re.IGNORECASE)
+        if m_to:
+            addr, alt = m_to.group(1), float(m_to.group(2))
+            cmds.append({'type': 'takeoff', 'address': addr, 'alt': alt})
+            continue
+        m_wp = re.match(r'(?:waypoint(?:\s*\d+)?)\s+at\s+(.+?)\s+at\s+altitude\s+(\d+\.?\d*)m', cl, re.IGNORECASE)
+        if m_wp:
+            addr, alt = m_wp.group(1), float(m_wp.group(2))
+            cmds.append({'type': 'waypoint', 'address': addr, 'alt': alt})
+            continue
+        if re.search(r'return to launch|rtl', cl, re.IGNORECASE):
+            cmds.append({'type': 'rtl'})
+    if not cmds:
+        return "error: no valid mission steps found in prompt"
+
+    await create_command(cmds)
+    result = await save_plan(file_path)
+    return result
+
 # 5. Run server through SSE transport
 if __name__ == "__main__":
-    # mcp.run(transport='sse')
-    mcp.run()
+    mcp.run(transport='sse')
+    # mcp.run()

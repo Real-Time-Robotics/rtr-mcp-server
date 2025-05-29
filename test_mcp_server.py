@@ -11,27 +11,32 @@ async def check():
             # print(tools)
 
             # Call set_home tool
-            # result = await session.call_tool("land")
-            # print(result)
+            result = await session.call_tool("clear_all_mission")
+            print(result)
+
+            # Get a vehicle's mission command sequence
+            mission_cmds = [
+                {"type": "takeoff", "lat": 0.0, "lon": 0.0, "alt": 10.0},
+                {"type": "waypoint", "address": "landmark 81", "alt": 30.0},
+            ]
+
+            # Gọi tool add_mission_commands
+            result = await session.call_tool(
+                "create_command",
+                arguments={"cmds": mission_cmds}
+            )
+            print("add_mission_commands response:", result)
 
             # Call arm tool
-            # result = await session.call_tool("arm", arguments={"command": "arm"})
-            # print(result)
-
-            # Call set_home tool
-            result = await session.call_tool("waypoints_info", arguments={"command": "waypoint info"})
+            result = await session.call_tool("arm", arguments={"command": "arm"})
             print(result)
 
             # Call takeoff tool
-            # result = await session.call_tool("readmission", arguments={"file_name": "/Users/maichieuthuy/Desktop/z.plan"})
-            # print(result)
-
-            # Call takeoff tool
-            # result = await session.call_tool("upload_mission", arguments={"file_name": "/Users/maichieuthuy/Desktop/z.plan"})
-            # print(result)
+            result = await session.call_tool("takeoff", arguments={"altitude": 10.0})
+            print(result)
 
             # Call goto tool
-            # result = await session.call_tool("goto", arguments={"latitude": 10.841626, "longitude": 106.773167, "altitude": 30.0})
+            # result = await session.call_tool("goto", arguments={"latitude": "landmark 81", "altitude": 30.0})
             # print(result)
 
             # Call landing tool
@@ -39,25 +44,12 @@ async def check():
             # print(result)
 
             # Call status tool
-            # result = await session.call_tool("switch_mode", arguments={"mode": "GUIDED"})
-            # print(result)
+            result = await session.call_tool("switch_mode", arguments={"mode": "AUTO"})
+            print(result)
 
             # Call status tool
             # result = await session.call_tool("status")
             # print(result)
-
-            # Get a vehicle's mission command sequence
-            # mission_cmds = [
-            #     {"type": "takeoff", "lat": 0.0, "lon": 0.0, "alt": 10.0},
-            #     {"type": "waypoint", "lat": 10.8418328, "lon": 106.775515, "alt": 30.0},
-            # ]
-            #
-            # # Gọi tool add_mission_commands
-            # result = await session.call_tool(
-            #     "create_command",
-            #     arguments={"cmds": mission_cmds}
-            # )
-            # print("add_mission_commands response:", result)
 
             # Call status tool
             # result = await session.call_tool("list_parameters")
@@ -67,11 +59,6 @@ async def check():
             # result = await session.call_tool("clear_all_mission")
             # print(result)
 
-            # Call get parameter tool
-            # result = await session.call_tool(
-            #     "create_command",arguments={"cmds": [{"type": "waypoint", "lat": 10.8418328, "lon": 106.775515, "alt": 30.0}]})
-            # print(result)
-            #
             # # Lấy lại sequence để verify
             # sequence = await session.call_tool("get_command_sequence")
             # print("\nMission command sequence:")
