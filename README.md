@@ -31,7 +31,7 @@ The server will listen on `http://0.0.0.0:8080` by default.
 ## 📡 Available MCP Tools
 
 | Tool                                       | Parameters                               | Description                                                     |
-| ------------------------------------------ | ---------------------------------------- | --------------------------------------------------------------- |
+|--------------------------------------------|------------------------------------------|-----------------------------------------------------------------|
 | `arm()`                                    | —                                        | Arm or disarm the vehicle.                                      |
 | `switch_mode(mode: str)`                   | `mode` — flight mode name                | Change flight mode (e.g. `"GUIDED"`, `"LOITER"`, `"RTL"`).      |
 | `status()`                                 | —                                        | Return current connection status and vehicle state.             |
@@ -49,8 +49,7 @@ The server will listen on `http://0.0.0.0:8080` by default.
 | `get_gimbal_attitude()`                    | —                                        | Read gimbal orientation.                                        |
 | `set_gimbal_orientation(pitch, roll, yaw)` | `float`                                  | Point the gimbal to the specified orientation.                  |
 | `release_gimbal()`                         | —                                        | Release control of the gimbal.                                  |
-| `get_gps_info()`                           | —                                        | Return GPSInfo: `eph`, `epv`, `fix_type`, `satellites_visible`. |
-| `list_parameters()`                        | —                                        | List all vehicle parameters.                                    |
+| `get_gps_info()`                           | —                                        | Return GPSInfo: `eph`, `epv`, `fix_type`, `satellites_visible`. |                                        | List all vehicle parameters.                                    |
 | `get_parameter(name: str)`                 | `name` — parameter key                   | Get the value of a specific parameter.                          |
 | `set_parameter(name: str, value)`          | `name`, `value`                          | Set a specific vehicle parameter.                               |
 | `get_capabilities()`                       | —                                        | Query autopilot capabilities.                                   |
